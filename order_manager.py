@@ -3,6 +3,11 @@ import json
 import asyncio
 from datetime import datetime
 from loguru import logger
+from config import (
+    ORDER_STATUS_ACTIVE, ORDER_STATUS_COMPLETED,
+    ORDER_SIDE_SELL, ORDER_SIDE_BUY,
+    CLIENT_ORDER_ID_PREFIX, TRADE_TYPE_AUTO
+)
 
 class OrderManager:
     def __init__(self, order_file="order.json"):
@@ -46,27 +51,89 @@ class OrderManager:
             orders_to_archive = []
             active_sell_parent_ids = set()  # ID покупок, связанных с активными продажами
 
-            # Собираем ID покупок, связанных с активными продажами
-            for order in orders:
-                if (order["status"] == "active" and 
-                    order["side"] == "SELL" and 
-                    order.get("client_order_id", "").startswith("BOT_")):
-                    parent_id = order.get("parent_order_id", "")
-                    if parent_id:
-                        active_sell_parent_ids.add(parent_id)
-
-            # Обрабатываем ордера
-            for order in orders:
-                if (order["status"] == "active" and 
-                    order["side"] == "SELL" and 
-                    order.get("client_order_id", "").startswith("BOT_")):
-                    active_orders.append(order)
-                elif (order["status"] == "completed" and 
-                      order["side"] == "BUY" and 
-                      order["order_id"] in active_sell_parent_ids):
-                    active_orders.append(order)
-                else:
-                    orders_to_archive.append(order)
+--- a/order_manager.py
++++ b/order_manager.py
+@@ -40,13 +40,13 @@
+ 
+             # Собираем ID покупок, связанных с активными продажами
+             for order in orders:
+-                if (order["status"] == "active" and
+-                    order["side"] == "SELL" and
+-                    order.get("client_order_id", "").startswith("BOT_")):
++                if (order["status"] == ORDER_STATUS_ACTIVE and
++                    order["side"] == ORDER_SIDE_SELL and
++                    order.get("client_order_id", "").startswith(CLIENT_ORDER_ID_PREFIX)):
+                     parent_id = order.get("parent_order_id", "")
+                     if parent_id:
+                         active_sell_parent_ids.add(parent_id)
+@@ -54,12 +54,12 @@
+ 
+             # Обрабатываем ордера
+             for order in orders:
+-                if (order["status"] == "active" and
+-                    order["side"] == "SELL" and
+-                    order.get("client_order_id", "").startswith("BOT_")):
++                if (order["status"] == ORDER_STATUS_ACTIVE and
++                    order["side"] == ORDER_SIDE_SELL and
++                    order.get("client_order_id", "").startswith(CLIENT_ORDER_ID_PREFIX)):
+                     active_orders.append(order)
+-                elif (order["status"] == "completed" and
+-                      order["side"] == "BUY" and
++                elif (order["status"] == ORDER_STATUS_COMPLETED and
++                      order["side"] == ORDER_SIDE_BUY and
+                       order["order_id"] in active_sell_parent_ids):
+                     active_orders.append(order)
+                 else:
+@@ -111,7 +111,7 @@
+                     if "parent_order_id" not in order:
+                         order["parent_order_id"] = ""
+                     if "client_order_id" not in order:
+-                        order["client_order_id"] = ""
++                        order["client_order_id"] = "" # This default might be okay, or ensure it's always set
+                     if "trade_type" not in order:
+-                        order["trade_type"] = "auto"
++                        order["trade_type"] = TRADE_TYPE_AUTO
+                 logger.debug(f"Загружено {len(orders)} ордеров из {filename}")
+                 return orders
+         except json.JSONDecodeError as e:
+@@ -132,22 +132,22 @@
+ 
+                 # Собираем ID покупок, связанных с активными продажами
+                 for order in orders:
+-                    if (order["status"] == "active" and
+-                        order["side"] == "SELL" and
+-                        order.get("client_order_id", "").startswith("BOT_")):
++                    if (order["status"] == ORDER_STATUS_ACTIVE and
++                        order["side"] == ORDER_SIDE_SELL and
++                        order.get("client_order_id", "").startswith(CLIENT_ORDER_ID_PREFIX)):
+                         parent_id = order.get("parent_order_id", "")
+                         if parent_id:
+                             active_sell_parent_ids.add(parent_id)
+ 
+                 # Обрабатываем ордера
+                 for order in orders:
+-                    if (order["status"] == "active" and
+-                        order["side"] == "SELL" and
+-                        order.get("client_order_id", "").startswith("BOT_")):
++                    if (order["status"] == ORDER_STATUS_ACTIVE and
++                        order["side"] == ORDER_SIDE_SELL and
++                        order.get("client_order_id", "").startswith(CLIENT_ORDER_ID_PREFIX)):
+                         active_orders.append(order)
+-                    elif (order["status"] == "completed" and
+-                          order["side"] == "BUY" and
++                    elif (order["status"] == ORDER_STATUS_COMPLETED and
++                          order["side"] == ORDER_SIDE_BUY and
+                           order["order_id"] in active_sell_parent_ids):
+                         active_orders.append(order)
+-                    elif (order["status"] == "completed" and
+-                          order["side"] == "SELL" and
+-                          order.get("client_order_id", "").startswith("BOT_") and
++                    elif (order["status"] == ORDER_STATUS_COMPLETED and
++                          order["side"] == ORDER_SIDE_SELL and
++                          order.get("client_order_id", "").startswith(CLIENT_ORDER_ID_PREFIX) and
+                           current_time - order.get("timestamp", 0) > 60000): # 1 minute
+                         orders_to_archive.append(order)
+                     else:
 
             if orders_to_archive:
                 orders_by_archive = {}
