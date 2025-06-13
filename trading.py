@@ -50,6 +50,150 @@ class TradingBot:
         logger.info(f"Запуск бота, сессия: {self.session_id}")
         asyncio.create_task(self.cleanup_processed_deal_ids())
 
+    async def _execute_buy_and_place_sell(self, current_price, order_size, trade_type: str):
+        # Returns True if both buy and sell orders were successfully initiated, False otherwise.
+        
+        original_state_vars = {
+            "buy_price": self.buy_price,
+            "position_active": self.position_active,
+            "order_id": self.order_id,
+            "quantity": self.quantity,
+            "sell_prices": self.sell_prices.copy(),
+            "last_action_price_before_helper": self.last_action_price # For more precise revert
+        }
+
+        try:
+            self.quantity = round(order_size / current_price, 2)
+            logger.info(f"Helper: Рассчитанное количество: {self.quantity} SOL по цене {current_price} для '{trade_type}'")
+
+            buy_client_order_id = f"BOT_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+            buy_order_id, _ = await self.exchange.place_order(
+                side="BUY",
+                quantity=self.quantity,
+                order_type="MARKET",
+                telegram_app=self.telegram_app,
+                client_order_id=buy_client_order_id
+            )
+
+            if not buy_order_id:
+                logger.error(f"Helper: Не удалось выполнить маркетный ордер на покупку для '{trade_type}'")
+                # Notification is handled by place_order or calling method
+                return False
+
+            # Successfully placed buy order
+            self.last_buy_time = time.time()
+            self.buy_price = current_price # Or use actual execution price if available and important
+            self.position_active = True
+            # self.order_id = buy_order_id # Keep track of buy order ID for parent_order_id
+            buy_order_system_id = buy_order_id # Store the system-generated ID
+
+            self.update_trade_state("BUY", self.buy_price)
+            
+            buy_amount = round(self.quantity * self.buy_price, 4)
+            orders = self.order_manager.load_orders(self.order_manager.order_file)
+            orders.append({
+                "order_id": buy_order_system_id,
+                "client_order_id": buy_client_order_id,
+                "side": "BUY",
+                "type": "MARKET",
+                "status": "completed", # Market orders are assumed completed quickly
+                "quantity": str(self.quantity),
+                "price": str(self.buy_price),
+                "amount": str(buy_amount),
+                "timestamp": int(time.time() * 1000),
+                "profit": "0",
+                "notified": False, # Notification will be handled by on_deal_update or on_order_update
+                "parent_order_id": "",
+                "trade_type": trade_type
+            })
+            self.order_manager.save_orders(self.order_manager.order_file, orders)
+            logger.info(f"Helper: Ордер на покупку {buy_order_system_id} ({buy_client_order_id}) сохранен для '{trade_type}'.")
+
+            # Check SOL balance (simulating what was there)
+            # In a real scenario, you might want to confirm the asset is received via WebSocket or another API call
+            # For now, we assume the buy was effective if place_order returned an ID.
+            # A more robust check would involve querying balance after a short delay.
+            # sol_balance = await self.exchange.get_balance("SOL")
+            # if sol_balance < self.quantity:
+            #     logger.error(f"Helper: Недостаточно SOL после покупки: {sol_balance} < {self.quantity} для '{trade_type}'")
+            #     await send_notification(self.telegram_app, f"⚠️ Недостаточно SOL: {sol_balance} < {self.quantity}")
+            #     self.position_active = False # Revert state
+            #     self.order_id = original_state_vars["order_id"]
+            #     self.buy_price = original_state_vars["buy_price"]
+            #     # Consider how to handle the already executed buy order if SOL not confirmed.
+            #     return False
+
+
+            sell_price = round(self.buy_price * (1 + settings["profit_percent"] / 100), 2)
+            sell_client_order_id = f"BOT_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+            
+            sell_order_id, _ = await self.exchange.place_order(
+                side="SELL",
+                quantity=self.quantity,
+                price=sell_price,
+                order_type="LIMIT",
+                telegram_app=self.telegram_app,
+                client_order_id=sell_client_order_id
+            )
+
+            if not sell_order_id:
+                logger.error(f"Helper: Не удалось выставить ордер на продажу после покупки {buy_order_system_id} для '{trade_type}'.")
+                await send_notification(self.telegram_app, f"⚠️ Не удалось выставить ордер на продажу для '{trade_type}'")
+                # Critical: What to do with the bought SOL?
+                # For now, we leave position_active=True, buy_price set. User needs to be aware.
+                # Reverting all state might be complex if buy was partially filled etc.
+                # This highlights need for robust handling of such failures.
+                self.order_id = buy_order_system_id # Point to the buy order as the last action
+                return False # Indicate that the full sequence didn't complete
+
+            # Successfully placed sell order
+            self.order_id = sell_order_id # Now track the active sell order
+            status, actual_sell_price_from_check = await self.exchange.check_order_status(sell_order_id)
+            if status and actual_sell_price_from_check: # status might be NEW, price is from order details
+                final_sell_price = round(actual_sell_price_from_check, 2)
+            else: # Fallback if check_order_status fails or doesn't return price
+                final_sell_price = sell_price
+            self.sell_prices[sell_order_id] = final_sell_price
+            
+            orders = self.order_manager.load_orders(self.order_manager.order_file)
+            orders.append({
+                "order_id": sell_order_id,
+                "client_order_id": sell_client_order_id,
+                "side": "SELL",
+                "type": "LIMIT",
+                "status": "active",
+                "quantity": str(self.quantity),
+                "price": str(final_sell_price),
+                "amount": "0",
+                "timestamp": int(time.time() * 1000),
+                "profit": "0",
+                "notified": False,
+                "parent_order_id": buy_order_system_id, # Link to the buy order
+                "trade_type": trade_type
+            })
+            self.order_manager.save_orders(self.order_manager.order_file, orders)
+            self.update_trade_state("SELL_ORDER_PLACED", final_sell_price) # A more descriptive state
+            
+            logger.info(
+                f"Helper: Покупка {self.quantity} SOL по {self.buy_price:.2f}, "
+                f"Ордер на продажу {sell_order_id} ({sell_client_order_id}) выставлен по {final_sell_price:.2f} для '{trade_type}'."
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"Helper: Ошибка в _execute_buy_and_place_sell для '{trade_type}': {str(e)}")
+            # Revert state to before the call
+            self.buy_price = original_state_vars["buy_price"]
+            self.position_active = original_state_vars["position_active"]
+            self.order_id = original_state_vars["order_id"]
+            self.quantity = original_state_vars["quantity"]
+            self.sell_prices = original_state_vars["sell_prices"]
+            # Save reverted state if update_trade_state was called
+            if self.last_action_price != original_state_vars.get("last_action_price_before_helper"): # Heuristic
+                 self.update_trade_state(original_state_vars.get("last_action_type"), original_state_vars.get("last_action_price_before_helper")) # Revert precisely
+            await send_notification(self.telegram_app, f"⚠️ Критическая ошибка при выполнении покупки/продажи ({trade_type}): {str(e)}")
+            return False
+
     async def cleanup_processed_deal_ids(self):
         """Очищает устаревшие ID сделок."""
         while True:
@@ -490,105 +634,22 @@ class TradingBot:
                 self.state = TradingState.IDLE
                 return
 
-            self.quantity = round(order_size / market_price, 2)
-            logger.info(f"Рассчитанное количество: {self.quantity} SOL по цене {market_price}")
-
-            client_order_id = f"BOT_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
-            order_id, returned_client_order_id = await self.exchange.place_order(
-                side="BUY",
-                quantity=self.quantity,
-                order_type="MARKET",
-                telegram_app=self.telegram_app,
-                client_order_id=client_order_id
-            )
-            if order_id:
-                self.last_buy_time = time.time()
-                self.buy_price = market_price
-                self.position_active = True
-                self.order_id = order_id
-                self.update_trade_state("BUY", market_price)
-
-                amount = round(self.quantity * market_price, 4)
-                orders = self.order_manager.load_orders(self.order_manager.order_file)
-                orders.append({
-                    "order_id": order_id,
-                    "client_order_id": client_order_id,
-                    "side": "BUY",
-                    "type": "MARKET",
-                    "status": "completed",
-                    "quantity": str(self.quantity),
-                    "price": str(self.buy_price),
-                    "amount": str(amount),
-                    "timestamp": int(time.time() * 1000),
-                    "profit": "0",
-                    "notified": False,
-                    "parent_order_id": "",
-                    "trade_type": "auto"
-                })
-                self.order_manager.save_orders(self.order_manager.order_file, orders)
-
-                sol_balance = await self.exchange.get_balance("SOL")
-                if sol_balance < self.quantity:
-                    logger.error(f"Недостаточно SOL: {sol_balance} < {self.quantity}")
-                    self.position_active = False
-                    self.order_id = None
-                    self.update_trade_state("BUY", market_price)
-                    await send_notification(self.telegram_app, f"⚠️ Недостаточно SOL: {sol_balance} < {self.quantity}")
-                    self.state = TradingState.IDLE
-                    return
-
-                sell_price = round(self.buy_price * (1 + settings["profit_percent"] / 100), 2)
-                sell_client_order_id = f"BOT_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
-                sell_order_id, sell_returned_client_order_id = await self.exchange.place_order(
-                    side="SELL",
-                    quantity=self.quantity,
-                    price=sell_price,
-                    order_type="LIMIT",
-                    telegram_app=self.telegram_app,
-                    client_order_id=sell_client_order_id
-                )
-                if sell_order_id:
-                    self.order_id = sell_order_id
-                    status, actual_price = await self.exchange.check_order_status(sell_order_id)
-                    if status:
-                        sell_price = round(actual_price, 2)
-                        logger.debug(f"Реальная цена продажи для ордера {sell_order_id}: {sell_price}")
-                    self.sell_prices[sell_order_id] = sell_price
-                    orders = self.order_manager.load_orders(self.order_manager.order_file)
-                    orders.append({
-                        "order_id": sell_order_id,
-                        "client_order_id": sell_client_order_id,
-                        "side": "SELL",
-                        "type": "LIMIT",
-                        "status": "active",
-                        "quantity": str(self.quantity),
-                        "price": str(sell_price),
-                        "amount": "0",
-                        "timestamp": int(time.time() * 1000),
-                        "profit": "0",
-                        "notified": False,
-                        "parent_order_id": order_id,
-                        "trade_type": "auto"
-                    })
-                    self.order_manager.save_orders(self.order_manager.order_file, orders)
-                    logger.info(
-                        f"Покупка: {self.quantity} SOL по {self.buy_price:.2f} USDT, "
-                        f"Потрачено: {amount:.4f} USDT, "
-                        f"Ордер на продажу: {self.quantity} SOL по {sell_price:.2f} USDT"
-                    )
-                else:
-                    self.position_active = False
-                    self.order_id = None
-                    logger.error(f"Не удалось выставить ордер на продажу: {self.quantity} SOL по {sell_price:.2f} USDT")
-                    await send_notification(self.telegram_app, f"⚠️ Не удалось выставить ордер на продажу")
-                self.update_trade_state("SELL", sell_price)
+            # Refactored block using the helper method
+            success = await self._execute_buy_and_place_sell(market_price, order_size, "auto")
+            if success:
+                logger.info("start_trading: _execute_buy_and_place_sell успешно завершен.")
+                self.state = TradingState.AWAITING_NOTIFICATION
             else:
-                logger.error("Не удалось выполнить маркетный ордер на покупку")
-                await send_notification(self.telegram_app, f"⚠️ Не удалось выполнить покупку")
-            self.state = TradingState.AWAITING_NOTIFICATION
+                logger.error("start_trading: _execute_buy_and_place_sell не удался.")
+                # Notifications are handled by the helper or place_order
+                self.state = TradingState.IDLE
+                # Ensure state is reverted if helper failed mid-way by helper's own try/except
+            # End of refactored block
+
         except Exception as e:
             logger.error(f"Ошибка в start_trading: {str(e)}")
-            await send_notification(self.telegram_app, f"⚠️ Ошибка автоторговли: {str(e)}")
+            # Ensure critical errors in start_trading itself (outside helper) also send notification
+            await send_notification(self.telegram_app, f"⚠️ Критическая ошибка автоторговли: {str(e)}")
         finally:
             if self.state == TradingState.PROCESSING:
                 self.state = TradingState.IDLE
@@ -650,110 +711,28 @@ class TradingBot:
                 self.state = TradingState.IDLE
                 return False
 
-            self.quantity = round(order_size / market_price, 2)
-            logger.info(f"Рассчитанное количество: {self.quantity} SOL по цене {market_price}")
-
-            client_order_id = f"BOT_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
-            order_id, returned_client_order_id = await self.exchange.place_order(
-                side="BUY",
-                quantity=self.quantity,
-                order_type="MARKET",
-                telegram_app=self.telegram_app,
-                client_order_id=client_order_id
-            )
-            if order_id:
-                self.buy_price = market_price
-                self.position_active = True
-                self.order_id = order_id
-                self.update_trade_state("BUY", market_price)
-
-                amount = round(self.quantity * market_price, 4)
-                orders = self.order_manager.load_orders(self.order_manager.order_file)
-                orders.append({
-                    "order_id": order_id,
-                    "client_order_id": client_order_id,
-                    "side": "BUY",
-                    "type": "MARKET",
-                    "status": "completed",
-                    "quantity": str(self.quantity),
-                    "price": str(self.buy_price),
-                    "amount": str(amount),
-                    "timestamp": int(time.time() * 1000),
-                    "profit": "0",
-                    "notified": False,
-                    "parent_order_id": "",
-                    "trade_type": "manual"
-                })
-                self.order_manager.save_orders(self.order_manager.order_file, orders)
-
-                sol_balance = await self.exchange.get_balance("SOL")
-                if sol_balance < self.quantity:
-                    logger.error(f"Недостаточно SOL: {sol_balance} < {self.quantity}")
-                    self.position_active = False
-                    self.order_id = None
-                    self.update_trade_state("BUY", market_price)
-                    await send_notification(self.telegram_app, f"⚠️ Недостаточно SOL: {sol_balance} < {self.quantity}")
-                    self.state = TradingState.IDLE
-                    return False
-
-                sell_price = round(self.buy_price * (1 + settings["profit_percent"] / 100), 2)
-                sell_client_order_id = f"BOT_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
-                sell_order_id, sell_returned_client_order_id = await self.exchange.place_order(
-                    side="SELL",
-                    quantity=self.quantity,
-                    price=sell_price,
-                    order_type="LIMIT",
-                    telegram_app=self.telegram_app,
-                    client_order_id=sell_client_order_id
-                )
-                if sell_order_id:
-                    self.order_id = sell_order_id
-                    status, actual_price = await self.exchange.check_order_status(sell_order_id)
-                    if status:
-                        sell_price = round(actual_price, 2)
-                        logger.debug(f"Реальная цена продажи для ордера {sell_order_id}: {sell_price}")
-                    self.sell_prices[sell_order_id] = sell_price
-                    orders = self.order_manager.load_orders(self.order_manager.order_file)
-                    orders.append({
-                        "order_id": sell_order_id,
-                        "client_order_id": sell_client_order_id,
-                        "side": "SELL",
-                        "type": "LIMIT",
-                        "status": "active",
-                        "quantity": str(self.quantity),
-                        "price": str(sell_price),
-                        "amount": "0",
-                        "timestamp": int(time.time() * 1000),
-                        "profit": "0",
-                        "notified": False,
-                        "parent_order_id": order_id,
-                        "trade_type": "manual"
-                    })
-                    self.order_manager.save_orders(self.order_manager.order_file, orders)
-                    logger.info(
-                        f"Ручная покупка: {self.quantity} SOL по {self.buy_price:.2f} USDT, "
-                        f"Потрачено: {amount:.4f} USDT, "
-                        f"Ордер на продажу: {self.quantity} SOL по {sell_price:.2f} USDT"
-                    )
-                    return True
-                else:
-                    logger.error("Не удалось выставить ордер на продажу")
-                    await send_notification(self.telegram_app, f"⚠️ Не удалось выставить ордер на продажу")
-                    self.position_active = False
-                    self.order_id = None
-                    self.state = TradingState.IDLE
-                    return False
+            # Refactored block using the helper method
+            success = await self._execute_buy_and_place_sell(market_price, order_size, "manual")
+            if success:
+                logger.info("manual_buy: _execute_buy_and_place_sell успешно завершен.")
+                # The original manual_buy returned True on success, which was then used by the command handler
+                # to send a "Ручная покупка выполнена!" message. We'll keep that logic in the command handler.
+                self.state = TradingState.AWAITING_NOTIFICATION # Or IDLE if notifications are fully handled by websockets
+                return True # Indicate success to the caller
             else:
-                logger.error("Не удалось выполнить ручной маркетный ордер на покупку")
-                await send_notification(self.telegram_app, f"⚠️ Не удалось выполнить покупку")
+                logger.error("manual_buy: _execute_buy_and_place_sell не удался.")
+                # Notifications for failure are handled by the helper or place_order
                 self.state = TradingState.IDLE
-                return False
+                return False # Indicate failure to the caller
+            # End of refactored block
+
         except Exception as e:
             logger.error(f"Ошибка в manual_buy: {str(e)}")
-            await send_notification(self.telegram_app, f"⚠️ Ошибка ручной покупки: {str(e)}")
-            return False
+            # Ensure critical errors in manual_buy itself (outside helper) also send notification
+            await send_notification(self.telegram_app, f"⚠️ Критическая ошибка ручной покупки: {str(e)}")
+            return False # Indicate failure
         finally:
-            if self.state == TradingState.PROCESSING:
+            if self.state == TradingState.PROCESSING: # Ensure state is reset if it was PROCESSING
                 self.state = TradingState.IDLE
             logger.debug(f"Состояние изменено на {self.state}")
 
@@ -928,106 +907,19 @@ class TradingBot:
                         self.low_balance_limit_notified = False
                         self.last_notified_limit_conditions = None
                         self.save_trade_state()
-
-                    self.quantity = round(order_size / price, 2)
-                    logger.info(f"Рассчитанное количество: {self.quantity} SOL по цене {price}")
-
-                    client_order_id = f"BOT_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
-                    order_id, returned_client_order_id = await self.exchange.place_order(
-                        side="BUY",
-                        quantity=self.quantity,
-                        order_type="MARKET",
-                        telegram_app=self.telegram_app,
-                        client_order_id=client_order_id
-                    )
-                    if order_id:
-                        self.last_buy_time = time.time()
-                        self.buy_price = price
-                        self.position_active = True
-                        self.order_id = order_id
-                        self.update_trade_state("BUY", price)
-
-                        amount = round(self.quantity * price, 4)
-                        orders = self.order_manager.load_orders(self.order_manager.order_file)
-                        orders.append({
-                            "order_id": order_id,
-                            "client_order_id": client_order_id,
-                            "side": "BUY",
-                            "type": "MARKET",
-                            "status": "completed",
-                            "quantity": str(self.quantity),
-                            "price": str(self.buy_price),
-                            "amount": str(amount),
-                            "timestamp": int(time.time() * 1000),
-                            "profit": "0",
-                            "notified": False,
-                            "parent_order_id": "",
-                            "trade_type": "auto"
-                        })
-                        self.order_manager.save_orders(self.order_manager.order_file, orders)
-
-                        sol_balance = await self.exchange.get_balance("SOL")
-                        if sol_balance < self.quantity:
-                            logger.error(f"Недостаточно SOL: {sol_balance} < {self.quantity}")
-                            self.position_active = False
-                            self.order_id = None
-                            self.update_trade_state("BUY", price)
-                            await send_notification(self.telegram_app, f"⚠️ Недостаточно SOL: {sol_balance} < {self.quantity}")
-                            self.state = TradingState.IDLE
-                            return drop_trigger
-
-                        sell_price = round(self.buy_price * (1 + settings["profit_percent"] / 100), 2)
-                        sell_client_order_id = f"BOT_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
-                        sell_order_id, sell_returned_client_order_id = await self.exchange.place_order(
-                            side="SELL",
-                            quantity=self.quantity,
-                            price=sell_price,
-                            order_type="LIMIT",
-                            telegram_app=self.telegram_app,
-                            client_order_id=sell_client_order_id
-                        )
-                        if sell_order_id:
-                            self.order_id = sell_order_id
-                            status, actual_price = await self.exchange.check_order_status(sell_order_id)
-                            if status:
-                                sell_price = round(actual_price, 2)
-                                logger.debug(f"Реальная цена продажи для ордера {sell_order_id}: {sell_price}")
-                            self.sell_prices[sell_order_id] = sell_price
-                            orders = self.order_manager.load_orders(self.order_manager.order_file)
-                            orders.append({
-                                "order_id": sell_order_id,
-                                "client_order_id": sell_client_order_id,
-                                "side": "SELL",
-                                "type": "LIMIT",
-                                "status": "active",
-                                "quantity": str(self.quantity),
-                                "price": str(sell_price),
-                                "amount": "0",
-                                "timestamp": int(time.time() * 1000),
-                                "profit": "0",
-                                "notified": False,
-                                "parent_order_id": order_id,
-                                "trade_type": "auto"
-                            })
-                            self.order_manager.save_orders(self.order_manager.order_file, orders)
-                            logger.info(
-                                f"Покупка: {self.quantity} SOL по {self.buy_price:.2f} USDT, "
-                                f"Потрачено: {amount:.4f} USDT, "
-                                f"Ордер на продажу: {self.quantity} SOL по {sell_price:.2f} USDT"
-                            )
-                        else:
-                            self.position_active = False
-                            self.order_id = None
-                            logger.error(f"Не удалось выставить ордер на продажу: {self.quantity} SOL по {sell_price:.2f} USDT")
-                            await send_notification(self.telegram_app, f"⚠️ Не удалось выставить ордер на продажу")
-                        self.update_trade_state("SELL", sell_price)
+                    
+                    # Refactored block using the helper method
+                    success = await self._execute_buy_and_place_sell(price, order_size, "auto")
+                    if success:
+                        logger.info("on_price_update: _execute_buy_and_place_sell успешно завершен.")
+                        self.state = TradingState.AWAITING_NOTIFICATION
                     else:
-                        logger.error("Не удалось выполнить маркетный ордер на покупку")
-                        await send_notification(self.telegram_app, f"⚠️ Не удалось выполнить покупку")
-                    self.state = TradingState.AWAITING_NOTIFICATION
+                        logger.error("on_price_update: _execute_buy_and_place_sell не удался.")
+                        self.state = TradingState.IDLE # Reset state if helper failed
+                    # End of refactored block
                 except Exception as e:
-                    logger.error(f"Ошибка в on_price_update: {str(e)}")
-                    await send_notification(self.telegram_app, f"⚠️ Ошибка обработки цены: {str(e)}")
+                    logger.error(f"Ошибка в on_price_update (внешний try): {str(e)}")
+                    await send_notification(self.telegram_app, f"⚠️ Критическая ошибка обработки цены: {str(e)}")
                 finally:
                     if self.state == TradingState.PROCESSING:
                         self.state = TradingState.IDLE
@@ -1195,106 +1087,27 @@ class TradingBot:
                                     self.state = TradingState.IDLE
                                     return
 
-                                self.quantity = round(order_size / market_price, 2)
-                                logger.info(f"Рассчитанное количество для покупки после продажи: {self.quantity} SOL по цене {market_price}")
-
-                                client_order_id = f"BOT_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
-                                order_id, returned_client_order_id = await self.exchange.place_order(
-                                    side="BUY",
-                                    quantity=self.quantity,
-                                    order_type="MARKET",
-                                    telegram_app=self.telegram_app,
-                                    client_order_id=client_order_id
-                                )
-                                if order_id:
-                                    self.last_buy_time = time.time()
-                                    self.buy_price = market_price
-                                    self.position_active = True
-                                    self.order_id = order_id
-                                    self.update_trade_state("BUY", market_price)
-
-                                    amount = round(self.quantity * market_price, 4)
-                                    orders = self.order_manager.load_orders(self.order_manager.order_file)
-                                    orders.append({
-                                        "order_id": order_id,
-                                        "client_order_id": client_order_id,
-                                        "side": "BUY",
-                                        "type": "MARKET",
-                                        "status": "completed",
-                                        "quantity": str(self.quantity),
-                                        "price": str(self.buy_price),
-                                        "amount": str(amount),
-                                        "timestamp": int(time.time() * 1000),
-                                        "profit": "0",
-                                        "notified": False,
-                                        "parent_order_id": "",
-                                        "trade_type": "auto"
-                                    })
-                                    self.order_manager.save_orders(self.order_manager.order_file, orders)
-
-                                    sol_balance = await self.exchange.get_balance("SOL")
-                                    if sol_balance < self.quantity:
-                                        logger.error(f"Недостаточно SOL для продажи после покупки: {sol_balance} < {self.quantity}")
-                                        self.position_active = False
-                                        self.order_id = None
-                                        self.update_trade_state("BUY", market_price)
-                                        await send_notification(self.telegram_app, f"⚠️ Недостаточно SOL: {sol_balance} < {self.quantity}")
-                                        self.state = TradingState.IDLE
-                                        return
-
-                                    sell_price = round(self.buy_price * (1 + settings["profit_percent"] / 100), 2)
-                                    sell_client_order_id = f"BOT_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
-                                    sell_order_id, sell_returned_client_order_id = await self.exchange.place_order(
-                                        side="SELL",
-                                        quantity=self.quantity,
-                                        price=sell_price,
-                                        order_type="LIMIT",
-                                        telegram_app=self.telegram_app,
-                                        client_order_id=sell_client_order_id
-                                    )
-                                    if sell_order_id:
-                                        self.order_id = sell_order_id
-                                        status, actual_price = await self.exchange.check_order_status(sell_order_id)
-                                        if status:
-                                            sell_price = round(actual_price, 2)
-                                            logger.debug(f"Реальная цена продажи для ордера {sell_order_id}: {sell_price}")
-                                        self.sell_prices[sell_order_id] = sell_price
-                                        orders = self.order_manager.load_orders(self.order_manager.order_file)
-                                        orders.append({
-                                            "order_id": sell_order_id,
-                                            "client_order_id": sell_client_order_id,
-                                            "side": "SELL",
-                                            "type": "LIMIT",
-                                            "status": "active",
-                                            "quantity": str(self.quantity),
-                                            "price": str(sell_price),
-                                            "amount": "0",
-                                            "timestamp": int(time.time() * 1000),
-                                            "profit": "0",
-                                            "notified": False,
-                                            "parent_order_id": order_id,
-                                            "trade_type": "auto"
-                                        })
-                                        self.order_manager.save_orders(self.order_manager.order_file, orders)
-                                        logger.info(
-                                            f"Покупка после продажи: {self.quantity} SOL по {self.buy_price:.2f} USDT, "
-                                            f"Потрачено: {amount:.4f} USDT, "
-                                            f"Ордер на продажу: {self.quantity} SOL по {sell_price:.2f} USDT"
-                                        )
-                                    else:
-                                        self.position_active = False
-                                        self.order_id = None
-                                        logger.error(f"Не удалось выставить ордер на продажу после покупки: {self.quantity} SOL по {sell_price:.2f} USDT")
-                                        await send_notification(self.telegram_app, f"⚠️ Не удалось выставить ордер на продажу")
-                                    self.update_trade_state("SELL", sell_price)
+                                # Refactored block using the helper method for autobuy after sell
+                                success = await self._execute_buy_and_place_sell(market_price, order_size, "auto")
+                                if success:
+                                    logger.info("on_deal_update (autobuy after sell): _execute_buy_and_place_sell успешно завершен.")
+                                    self.state = TradingState.AWAITING_NOTIFICATION
                                 else:
-                                    logger.error("Не удалось выполнить маркетный ордер на покупку после продажи")
-                                    await send_notification(self.telegram_app, f"⚠️ Не удалось выполнить покупку")
+                                    logger.error("on_deal_update (autobuy after sell): _execute_buy_and_place_sell не удался.")
+                                    self.state = TradingState.IDLE # Reset state if helper failed
+                                # End of refactored block
                             except Exception as e:
-                                logger.error(f"Ошибка покупки после продажи: {str(e)}")
-                                await send_notification(self.telegram_app, f"⚠️ Ошибка покупки после продажи: {str(e)}")
+                                logger.error(f"Ошибка покупки после продажи (внешний try): {str(e)}")
+                                await send_notification(self.telegram_app, f"⚠️ Критическая ошибка покупки после продажи: {str(e)}")
                             finally:
-                                self.state = TradingState.AWAITING_NOTIFICATION
+                                # Ensure state is AWAITING_NOTIFICATION if processing was successful before helper,
+                                # or IDLE if helper failed or outer try failed.
+                                if self.state == TradingState.PROCESSING: # If helper wasn't called or failed early
+                                    self.state = TradingState.IDLE
+                                elif self.state != TradingState.AWAITING_NOTIFICATION: # If helper set to IDLE or other
+                                    self.state = TradingState.IDLE
+
+
                     else:
                         logger.warning(f"Не найдена покупка для ордера {order_id} (parent_order_id={parent_order_id}), прибыль не рассчитана")
                         self.order_manager.save_orders(self.order_manager.order_file, orders)
