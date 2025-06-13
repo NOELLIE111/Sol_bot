@@ -26,7 +26,7 @@ class OrderManager:
             if not os.path.exists(self.order_file):
                 logger.info(f"Файл {self.order_file} не найден, создаётся новый")
                 self.save_orders(self.order_file, [])
-            
+
             current_time = datetime.now()
             archive_file = self.get_archive_filename(current_time)
             if not os.path.exists(archive_file):
@@ -51,89 +51,27 @@ class OrderManager:
             orders_to_archive = []
             active_sell_parent_ids = set()  # ID покупок, связанных с активными продажами
 
---- a/order_manager.py
-+++ b/order_manager.py
-@@ -40,13 +40,13 @@
- 
-             # Собираем ID покупок, связанных с активными продажами
-             for order in orders:
--                if (order["status"] == "active" and
--                    order["side"] == "SELL" and
--                    order.get("client_order_id", "").startswith("BOT_")):
-+                if (order["status"] == ORDER_STATUS_ACTIVE and
-+                    order["side"] == ORDER_SIDE_SELL and
-+                    order.get("client_order_id", "").startswith(CLIENT_ORDER_ID_PREFIX)):
-                     parent_id = order.get("parent_order_id", "")
-                     if parent_id:
-                         active_sell_parent_ids.add(parent_id)
-@@ -54,12 +54,12 @@
- 
-             # Обрабатываем ордера
-             for order in orders:
--                if (order["status"] == "active" and
--                    order["side"] == "SELL" and
--                    order.get("client_order_id", "").startswith("BOT_")):
-+                if (order["status"] == ORDER_STATUS_ACTIVE and
-+                    order["side"] == ORDER_SIDE_SELL and
-+                    order.get("client_order_id", "").startswith(CLIENT_ORDER_ID_PREFIX)):
-                     active_orders.append(order)
--                elif (order["status"] == "completed" and
--                      order["side"] == "BUY" and
-+                elif (order["status"] == ORDER_STATUS_COMPLETED and
-+                      order["side"] == ORDER_SIDE_BUY and
-                       order["order_id"] in active_sell_parent_ids):
-                     active_orders.append(order)
-                 else:
-@@ -111,7 +111,7 @@
-                     if "parent_order_id" not in order:
-                         order["parent_order_id"] = ""
-                     if "client_order_id" not in order:
--                        order["client_order_id"] = ""
-+                        order["client_order_id"] = "" # This default might be okay, or ensure it's always set
-                     if "trade_type" not in order:
--                        order["trade_type"] = "auto"
-+                        order["trade_type"] = TRADE_TYPE_AUTO
-                 logger.debug(f"Загружено {len(orders)} ордеров из {filename}")
-                 return orders
-         except json.JSONDecodeError as e:
-@@ -132,22 +132,22 @@
- 
-                 # Собираем ID покупок, связанных с активными продажами
-                 for order in orders:
--                    if (order["status"] == "active" and
--                        order["side"] == "SELL" and
--                        order.get("client_order_id", "").startswith("BOT_")):
-+                    if (order["status"] == ORDER_STATUS_ACTIVE and
-+                        order["side"] == ORDER_SIDE_SELL and
-+                        order.get("client_order_id", "").startswith(CLIENT_ORDER_ID_PREFIX)):
-                         parent_id = order.get("parent_order_id", "")
-                         if parent_id:
-                             active_sell_parent_ids.add(parent_id)
- 
-                 # Обрабатываем ордера
-                 for order in orders:
--                    if (order["status"] == "active" and
--                        order["side"] == "SELL" and
--                        order.get("client_order_id", "").startswith("BOT_")):
-+                    if (order["status"] == ORDER_STATUS_ACTIVE and
-+                        order["side"] == ORDER_SIDE_SELL and
-+                        order.get("client_order_id", "").startswith(CLIENT_ORDER_ID_PREFIX)):
-                         active_orders.append(order)
--                    elif (order["status"] == "completed" and
--                          order["side"] == "BUY" and
-+                    elif (order["status"] == ORDER_STATUS_COMPLETED and
-+                          order["side"] == ORDER_SIDE_BUY and
-                           order["order_id"] in active_sell_parent_ids):
-                         active_orders.append(order)
--                    elif (order["status"] == "completed" and
--                          order["side"] == "SELL" and
--                          order.get("client_order_id", "").startswith("BOT_") and
-+                    elif (order["status"] == ORDER_STATUS_COMPLETED and
-+                          order["side"] == ORDER_SIDE_SELL and
-+                          order.get("client_order_id", "").startswith(CLIENT_ORDER_ID_PREFIX) and
-                           current_time - order.get("timestamp", 0) > 60000): # 1 minute
-                         orders_to_archive.append(order)
-                     else:
+            # Собираем ID покупок, связанных с активными продажами
+            for order in orders:
+                if (order["status"] == ORDER_STATUS_ACTIVE and
+                    order["side"] == ORDER_SIDE_SELL and
+                    order.get("client_order_id", "").startswith(CLIENT_ORDER_ID_PREFIX)):
+                    parent_id = order.get("parent_order_id", "")
+                    if parent_id:
+                        active_sell_parent_ids.add(parent_id)
+
+            # Обрабатываем ордера
+            for order in orders:
+                if (order["status"] == ORDER_STATUS_ACTIVE and
+                    order["side"] == ORDER_SIDE_SELL and
+                    order.get("client_order_id", "").startswith(CLIENT_ORDER_ID_PREFIX)):
+                    active_orders.append(order)
+                elif (order["status"] == ORDER_STATUS_COMPLETED and
+                      order["side"] == ORDER_SIDE_BUY and
+                      order["order_id"] in active_sell_parent_ids):
+                    active_orders.append(order)
+                else:
+                    orders_to_archive.append(order)
 
             if orders_to_archive:
                 orders_by_archive = {}
@@ -144,11 +82,11 @@ class OrderManager:
                         orders_by_archive[archive_file] = []
                     orders_by_archive[archive_file].append(order)
 
-                for archive_file, archive_orders in orders_by_archive.items():
-                    existing_orders = self.load_orders(archive_file)
-                    existing_orders.extend(archive_orders)
-                    self.save_orders(archive_file, existing_orders)
-                    logger.info(f"Перенесено {len(archive_orders)} ордеров в {archive_file}")
+                for archive_file_path, archive_orders_list in orders_by_archive.items():
+                    existing_orders = self.load_orders(archive_file_path)
+                    existing_orders.extend(archive_orders_list)
+                    self.save_orders(archive_file_path, existing_orders)
+                    logger.info(f"Перенесено {len(archive_orders_list)} ордеров в {archive_file_path}")
 
                 self.save_orders(self.order_file, active_orders)
                 logger.info(f"Обновлен {self.order_file}: оставлено {len(active_orders)} ордеров")
@@ -164,17 +102,17 @@ class OrderManager:
                 if not os.path.exists(archive_file):
                     logger.info(f"Новый месяц, создаётся архивный файл: {archive_file}")
                     self.save_orders(archive_file, [])
-                await asyncio.sleep(86400)
+                await asyncio.sleep(86400)  # Check once a day
             except Exception as e:
                 logger.error(f"Ошибка проверки смены месяца: {str(e)}")
-                await asyncio.sleep(3600)
+                await asyncio.sleep(3600) # Retry in an hour if error
 
-    def save_orders(self, filename, orders):
+    def save_orders(self, filename, orders_to_save):
         """Сохраняет ордера в указанный файл."""
         try:
             with open(filename, "w", encoding="utf-8") as f:
-                json.dump(orders, f, indent=4, ensure_ascii=False)
-            logger.info(f"Ордера сохранены в {filename}: {len(orders)} записей")
+                json.dump(orders_to_save, f, indent=4, ensure_ascii=False)
+            logger.info(f"Ордера сохранены в {filename}: {len(orders_to_save)} записей")
         except Exception as e:
             logger.error(f"Ошибка сохранения файла {filename}: {str(e)}")
 
@@ -189,8 +127,8 @@ class OrderManager:
                 if not content:
                     logger.warning(f"Файл {filename} пуст, возвращается пустой список")
                     return []
-                orders = json.loads(content)
-                for order in orders:
+                loaded_orders_list = json.loads(content)
+                for order in loaded_orders_list:
                     if "notified" not in order:
                         order["notified"] = False
                     if "parent_order_id" not in order:
@@ -198,9 +136,9 @@ class OrderManager:
                     if "client_order_id" not in order:
                         order["client_order_id"] = ""
                     if "trade_type" not in order:
-                        order["trade_type"] = "auto"
-                logger.debug(f"Загружено {len(orders)} ордеров из {filename}")
-                return orders
+                        order["trade_type"] = TRADE_TYPE_AUTO
+                logger.debug(f"Загружено {len(loaded_orders_list)} ордеров из {filename}")
+                return loaded_orders_list
         except json.JSONDecodeError as e:
             logger.error(f"Ошибка декодирования файла {filename}: {str(e)}")
             return []
@@ -213,52 +151,57 @@ class OrderManager:
         while True:
             try:
                 current_time = int(datetime.now().timestamp() * 1000)
-                orders = self.load_orders(self.order_file)
+                orders_list = self.load_orders(self.order_file)
                 active_orders = []
                 orders_to_archive = []
                 active_sell_parent_ids = set()
 
                 # Собираем ID покупок, связанных с активными продажами
-                for order in orders:
-                    if (order["status"] == "active" and 
-                        order["side"] == "SELL" and 
-                        order.get("client_order_id", "").startswith("BOT_")):
+                for order in orders_list:
+                    if (order["status"] == ORDER_STATUS_ACTIVE and
+                        order["side"] == ORDER_SIDE_SELL and
+                        order.get("client_order_id", "").startswith(CLIENT_ORDER_ID_PREFIX)):
                         parent_id = order.get("parent_order_id", "")
                         if parent_id:
                             active_sell_parent_ids.add(parent_id)
 
                 # Обрабатываем ордера
-                for order in orders:
-                    if (order["status"] == "active" and 
-                        order["side"] == "SELL" and 
-                        order.get("client_order_id", "").startswith("BOT_")):
+                for order in orders_list:
+                    if (order["status"] == ORDER_STATUS_ACTIVE and
+                        order["side"] == ORDER_SIDE_SELL and
+                        order.get("client_order_id", "").startswith(CLIENT_ORDER_ID_PREFIX)):
                         active_orders.append(order)
-                    elif (order["status"] == "completed" and 
-                          order["side"] == "BUY" and 
+                    elif (order["status"] == ORDER_STATUS_COMPLETED and
+                          order["side"] == ORDER_SIDE_BUY and
                           order["order_id"] in active_sell_parent_ids):
                         active_orders.append(order)
-                    elif (order["status"] == "completed" and 
-                          order["side"] == "SELL" and 
-                          order.get("client_order_id", "").startswith("BOT_") and 
-                          current_time - order.get("timestamp", 0) > 60000):
+                    elif (order["status"] == ORDER_STATUS_COMPLETED and
+                          order["side"] == ORDER_SIDE_SELL and
+                          order.get("client_order_id", "").startswith(CLIENT_ORDER_ID_PREFIX) and
+                          current_time - order.get("timestamp", 0) > 60000):  # 1 minute
                         orders_to_archive.append(order)
                     else:
-                        orders_to_archive.append(order)
+                        if order["status"] == ORDER_STATUS_COMPLETED:
+                             orders_to_archive.append(order)
+                        elif order not in active_orders and order not in orders_to_archive:
+                             orders_to_archive.append(order)
 
                 if orders_to_archive:
                     orders_by_archive = {}
-                    for order in orders_to_archive:
-                        execution_time = datetime.fromtimestamp(order["timestamp"] / 1000)
+                    for order_item in orders_to_archive:
+                        execution_time = datetime.fromtimestamp(order_item["timestamp"] / 1000)
                         archive_file = self.get_archive_filename(execution_time)
                         if archive_file not in orders_by_archive:
                             orders_by_archive[archive_file] = []
-                        orders_by_archive[archive_file].append(order)
+                        orders_by_archive[archive_file].append(order_item)
 
-                    for archive_file, archive_orders in orders_by_archive.items():
-                        existing_orders = self.load_orders(archive_file)
-                        existing_orders.extend(archive_orders)
-                        self.save_orders(archive_file, existing_orders)
-                        logger.info(f"Архивировано {len(archive_orders)} ордеров в {archive_file}")
+                    for archive_file_path, archive_orders_list_to_save in orders_by_archive.items():
+                        existing_orders = self.load_orders(archive_file_path)
+                        for o_to_save in archive_orders_list_to_save:
+                            if not any(existing_o["order_id"] == o_to_save["order_id"] for existing_o in existing_orders):
+                                existing_orders.append(o_to_save)
+                        self.save_orders(archive_file_path, existing_orders)
+                        logger.info(f"Архивировано {len(archive_orders_list_to_save)} ордеров (с учетом дубликатов) в {archive_file_path}")
 
                     self.save_orders(self.order_file, active_orders)
                     logger.info(f"Обновлен {self.order_file}: оставлено {len(active_orders)} ордеров")
